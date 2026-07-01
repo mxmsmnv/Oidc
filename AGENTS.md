@@ -37,6 +37,8 @@ For a normal public website with a login page:
 7. Protect private pages by redirecting anonymous users to `/login/?return=...`.
 8. Use `?return=` to send users back after login, or set Redirect after login in module settings.
 
+Important security behavior: first-time OIDC login does not silently attach to an existing local user by email. The module links users by stable provider identity (`provider + issuer + subject`). If a local account with the same email already exists, the user should login locally first and then use the OIDC button as an explicit linking action.
+
 Canonical template usage:
 
 ```php
@@ -106,6 +108,7 @@ Use `Oidc::resolveIdentity` to inspect or normalize provider identity before log
 ```php
 $wire->addHookAfter('Oidc::resolveIdentity', function(HookEvent $e) {
     $identity = $e->return;
+    // Includes email, email_verified, provider, issuer, subject, raw, and id_token.
     $identity['name'] = trim((string) ($identity['name'] ?? ''));
     $e->return = $identity;
 });
@@ -122,11 +125,12 @@ $wire->addHookAfter('Oidc::loginUser', function(HookEvent $e) {
 });
 ```
 
-Use `Oidc::registerUser` to take over or extend auto-registration:
+Use `Oidc::registerUser` to take over or extend auto-registration. The fourth argument is the resolved identity array:
 
 ```php
 $wire->addHookBefore('Oidc::registerUser', function(HookEvent $e) {
     $email = (string) $e->arguments('email');
+    $identity = $e->arguments(3);
 
     if(!str_ends_with($email, '@example.com')) {
         throw new Wire404Exception('Access denied.');
@@ -149,6 +153,7 @@ $wire->addHookAfter('Oidc::getProviderDefs', function(HookEvent $e) {
         'email_field' => 'email',
         'name_field' => 'name',
         'verified_field' => null,
+        'email_verified_required' => false,
         'extra_emails' => false,
         'oidc' => false,
     ];
@@ -167,6 +172,7 @@ Safe to suggest or implement with normal project approval:
 - Button style.
 - Default provider ordering.
 - Protected path for silent mode.
+- Role allow-list for frontend-only OIDC login.
 - Rendering login buttons in a login template.
 - Redirecting protected templates to a login page.
 
@@ -177,6 +183,8 @@ Requires explicit human approval:
 - Adding, removing or rotating OAuth/OIDC credentials.
 - Enabling auto-registration on a production site.
 - Assigning a role to newly registered users.
+- Enabling email fallback account linking.
+- Disabling the default superuser OIDC login block.
 - Changing registration policy hooks.
 - Adding a custom provider definition.
 - Changing redirect behavior for admin/editor users.
@@ -216,8 +224,10 @@ Custom OIDC provider IDs should be lowercase slugs. Register provider callback U
 - Do not assume Oidc is installed just because this file exists in a repository. Confirm live site state.
 - Do not create a callback route separate from the page that renders login buttons unless the module configuration and provider apps are updated accordingly.
 - Do not forget to preserve `?return=` when protecting pages.
+- Do not rely on email-only account matching; stable provider identity links are the login key.
 - Do not enable Silent mode globally on a public site unless the user explicitly wants the entire frontend behind SSO.
 - Do not assign privileged roles to auto-registered users without explicit approval.
+- Do not disable the superuser login block without explicit approval.
 - Do not hard-code secrets into templates, `ready.php`, README files or examples.
 - Do not promise full account-management features that this module does not provide.
 - Do not bypass OIDC discovery for standard OIDC providers unless a provider requires custom behavior.

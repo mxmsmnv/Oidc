@@ -173,7 +173,7 @@ $wire->addHookAfter('Oidc::loginUser', function(HookEvent $e) {
 
 ### Blocking registration from unknown domains
 
-Disable **Auto-register new users** in Settings, then:
+Keep **Auto-register new users** enabled and block unwanted registrations before the module creates the account:
 
 ```php
 $wire->addHookBefore('Oidc::registerUser', function(HookEvent $e) {
@@ -265,7 +265,10 @@ The module appends `/.well-known/openid-configuration` and auto-fetches all endp
 | **Default provider** | Provider used for silent mode redirect. Also displayed first in `renderButtons()`. Falls back to the first configured provider. |
 | **Button style** | `Full` — icon + provider name. `Icon` — icon only. |
 | **Auto-register new users** | When off, unknown emails throw a 404. Use `registerUser` hook for custom logic. |
+| **Allow email fallback linking** | Security-sensitive legacy mode. When off, existing accounts are not matched by email on first OIDC login; users must login first and link the provider explicitly. |
 | **Role for new users** | Role name assigned on auto-registration. Leave blank for none. |
+| **Block superuser login** | Prevents OIDC from creating a superuser session even if a provider identity is linked. Enabled by default. |
+| **Allowed login roles** | Optional comma-separated role names. Leave blank to allow any non-superuser account. |
 
 ---
 
@@ -277,12 +280,12 @@ Fill **Client ID** and **Client Secret** in the Providers table to enable a prov
 
 | Provider | Notes |
 |---|---|
-| Google | OIDC — uses verified `id_token` claims when available |
+| Google | OIDC — verifies `id_token` with JWKS and uses `email_verified` |
 | GitHub | Fetches primary verified email from `/user/emails` endpoint |
-| LinkedIn | OIDC — `openid profile email` scope |
-| Microsoft | Falls back to `userPrincipalName` when `mail` is null |
-| Yandex | OAuth 2.0 |
-| Yahoo | OIDC |
+| LinkedIn | OIDC — verifies `id_token` with LinkedIn JWKS |
+| Microsoft | OIDC — verifies `id_token`; falls back to `userPrincipalName` when `mail` is null |
+| Yandex | OAuth 2.0 — does not provide a standard verified-email claim |
+| Yahoo | OIDC — verifies `id_token` with Yahoo JWKS |
 
 ### Custom OIDC provider
 
@@ -292,14 +295,17 @@ One custom provider configured directly in module settings. Suitable for Okta, A
 
 ## Redirect flow
 
-1. User clicks a button → `?oidc=google` → module redirects to provider authorization URL with CSRF `state`, OIDC `nonce`, and optional PKCE
+1. User clicks a button → `?oidc=google` → module redirects to provider authorization URL with CSRF `state`, OIDC `nonce`, and S256 PKCE where configured
 2. Provider redirects back to callback URL with `?code&state`
 3. Module verifies state, handles provider errors, exchanges code for token, resolves identity
 4. `resolveIdentity` hook fires — inspect or modify the identity
-5. Module finds an existing user by email, or auto-registers a new one
-6. `loginUser` or `registerUser` hook fires → redirect to destination
+5. Module looks up an existing provider identity link by `provider + issuer + subject`
+6. If no link exists and the visitor is already logged in, the module links that provider identity to the current account
+7. If no link exists and a local user already has the same email, login is blocked by default; enable **Allow email fallback linking** only as an explicit legacy opt-in
+8. If no link exists and no local email match exists, the module auto-registers a new user when enabled
+9. `loginUser` or `registerUser` hook fires → redirect to destination
 
-For OIDC providers with `jwks_uri`, `id_token` claims are accepted only after RS256 signature verification and standard claim checks (`iss`, `aud`, expiry, and `nonce`). If token claims cannot be verified and a UserInfo endpoint is available, the module falls back to UserInfo.
+For OIDC providers, returned `id_token` claims are accepted only after RS256 signature verification and standard claim checks (`iss`, `aud`, expiry, and `nonce`). If an OIDC provider returns an `id_token` that cannot be verified, login fails closed instead of silently falling back to UserInfo.
 
 ---
 
@@ -314,7 +320,8 @@ Fires after identity is resolved from the provider, before the login/register de
 ```php
 $wire->addHookAfter('Oidc::resolveIdentity', function(HookEvent $e) {
     $identity = $e->return;
-    // ['email' => '...', 'name' => '...', 'provider' => 'google', 'raw' => [...]]
+    // ['email' => '...', 'name' => '...', 'provider' => 'google',
+    //  'issuer' => '...', 'subject' => '...', 'raw' => [...]]
 
     $identity['name'] = trim($identity['name']);
 
@@ -337,13 +344,14 @@ $wire->addHookAfter('Oidc::loginUser', function(HookEvent $e) {
 
 ### `Oidc::registerUser`
 
-Fires when no existing user matches the email and `autoRegister` is enabled. Hook `before` with `$e->replace = true` to take over completely, or hook `after` to modify the result.
+Fires when no provider identity link exists, no existing local account blocks registration, and `autoRegister` is enabled. Hook `before` with `$e->replace = true` to take over completely, or hook `after` to modify the result. The fourth argument contains the resolved identity array.
 
 ```php
 $wire->addHookBefore('Oidc::registerUser', function(HookEvent $e) {
     $email    = $e->arguments('email');
     $name     = $e->arguments('name');
     $provider = $e->arguments('provider');
+    $identity = $e->arguments(3);
 
     // ... your logic
     $e->replace = true;
@@ -372,6 +380,8 @@ After a successful login the module sets:
 |---|---|
 | `$session->oidc_provider` | Provider ID string (`google`, `github`, etc.) |
 
+Provider identity links are stored in module configuration as hashed `provider + issuer + subject` keys pointing to ProcessWire user IDs.
+
 ---
 
 ## Provider definition keys
@@ -393,11 +403,12 @@ After a successful login the module sets:
 | `email_fallback` | string | Alternative field when `email_field` is null (Microsoft) |
 | `name_field` | string\|array | Field(s) for display name — array values are joined with a space |
 | `verified_field` | string\|null | Field that must be truthy; `null` = skip check |
+| `email_verified_required` | bool | Require a verified email signal. Defaults to `true`; providers without such a signal must opt out explicitly. |
 | `extra_emails` | bool | Fetch emails from separate endpoint (GitHub) |
 | `emails_url` | string | URL for extra emails endpoint |
-| `pkce` | bool | Use PKCE code challenge (required for Twitter/X) |
+| `pkce` | bool | Use S256 PKCE code challenge |
 | `graph_api` | bool | Pass token as `?access_token=` not Bearer (Facebook) |
-| `oidc` | bool | Try verified `id_token` claims before fetching userinfo |
+| `oidc` | bool | Validate `id_token` claims before fetching UserInfo |
 
 ---
 

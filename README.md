@@ -20,9 +20,11 @@ If this project helps your work, consider supporting future development: [GitHub
 - Supports custom OIDC providers through discovery URLs.
 - Works with Okta, Auth0, Keycloak, authentik, Azure AD, Dex and similar providers.
 - Handles OAuth callbacks automatically on frontend pages.
-- Verifies OIDC `id_token` claims with nonce, issuer, audience, expiry and RS256/JWKS checks when available.
+- Verifies OIDC `id_token` claims with nonce, issuer, audience, expiry and RS256/JWKS checks.
 - Falls back to UserInfo for providers that expose identity through API endpoints.
+- Links local users by stable provider identity (`issuer` + `subject`) instead of email-only matching.
 - Auto-registers new ProcessWire users or lets hooks take over registration.
+- Blocks superuser OIDC login by default and supports role allow-lists.
 - Preserves return URLs through the login flow.
 - Includes silent mode for SSO-only sites and intranets.
 - Provides hook points for identity resolution, login, registration and provider definitions.

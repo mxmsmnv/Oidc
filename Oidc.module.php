@@ -65,6 +65,10 @@
  * @property string $loginRedirect  URL to redirect after login (empty = ?oidc_login=1)
  * @property bool   $autoRegister   Auto-register unknown users
  * @property string $newUserRole    Role name assigned to auto-registered users
+ * @property array  $identityLinks  Provider subject links keyed by provider/issuer/sub
+ * @property bool   $allowEmailAccountLink  Allow first OIDC login to attach to an existing email match
+ * @property bool   $blockSuperuserLogin    Block OIDC login for superusers
+ * @property string $allowedLoginRoles      Optional comma-separated role allow-list
  */
 class Oidc extends WireData implements Module, ConfigurableModule {
 
@@ -72,7 +76,7 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 		return [
 			'title'    => 'Oidc',
 			'summary'  => 'OAuth 2.0 / OpenID Connect: Google, GitHub, LinkedIn, Microsoft, Yandex, Yahoo, and any OIDC-compatible provider.',
-			'version'  => 111,
+			'version'  => 112,
 			'icon'     => 'key',
 			'author'   => 'Maxim Semenov',
 			'href'     => 'https://smnv.org',
@@ -95,6 +99,10 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 		$this->set('silentMode',       false);
 		$this->set('silentPath',       '');
 		$this->set('defaultProvider',  '');
+		$this->set('identityLinks',    []);
+		$this->set('allowEmailAccountLink', false);
+		$this->set('blockSuperuserLogin',   true);
+		$this->set('allowedLoginRoles',     '');
 		parent::__construct();
 	}
 
@@ -339,11 +347,21 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 		// ---- Step 4: resolve user info ----
 		$userInfo = [];
 
-		// OIDC: decode id_token claims first (avoids an extra HTTP call)
-		if(!empty($cfg['oidc']) && !empty($tokenResp['id_token'])) {
+		// OIDC: validate id_token claims first (avoids an extra HTTP call)
+		$tokenClaims = [];
+		if(!empty($cfg['oidc'])) {
 			$nonce = (string) $session->getFor($this, $nonceKey);
 			$session->removeFor($this, $nonceKey);
-			$userInfo = $this->validateIdToken($tokenResp['id_token'], $cfg, $nonce);
+			if(!empty($tokenResp['id_token'])) {
+				if(empty($cfg['jwks_uri'])) {
+					throw new WireException("OIDC: cannot verify id_token for {$cfg['label']} because jwks_uri is missing");
+				}
+				$tokenClaims = $this->validateIdToken($tokenResp['id_token'], $cfg, $nonce);
+				if(!$tokenClaims) {
+					throw new WireException("OIDC: id_token validation failed for {$cfg['label']}");
+				}
+				$userInfo = $tokenClaims;
+			}
 		}
 
 		// Facebook: token as query param, not Bearer
@@ -362,9 +380,14 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 			$userInfo = $userInfo['data'];
 		}
 
-		// Verified email check
+		// Verified email check. Providers that cannot prove email verification must
+		// opt out explicitly; email is never used as the default account link key.
+		$emailVerified = false;
 		$verifiedField = $cfg['verified_field'] ?? null;
-		if($verifiedField && empty($userInfo[$verifiedField])) {
+		if($verifiedField) {
+			$emailVerified = $this->truthy($userInfo[$verifiedField] ?? null);
+		}
+		if($verifiedField && !$emailVerified) {
 			throw new WireException("OIDC: unverified email from {$cfg['label']}");
 		}
 
@@ -373,8 +396,9 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 		if(!empty($cfg['extra_emails']) && !empty($cfg['emails_url'])) {
 			// GitHub: fetch primary verified email from separate endpoint
 			foreach($this->httpGet($cfg['emails_url'], $accessToken) as $entry) {
-				if(!empty($entry['primary']) && !empty($entry['verified'])) {
+				if($this->truthy($entry['primary'] ?? null) && $this->truthy($entry['verified'] ?? null)) {
 					$email = $entry['email'];
+					$emailVerified = true;
 					break;
 				}
 			}
@@ -391,6 +415,9 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 		if(!$email) {
 			throw new WireException("OIDC: could not retrieve a valid email from {$cfg['label']}");
 		}
+		if(($cfg['email_verified_required'] ?? true) && !$emailVerified) {
+			throw new WireException("OIDC: {$cfg['label']} did not provide a verified email claim");
+		}
 
 		// ---- Resolve display name ----
 		$nameField = $cfg['name_field'] ?? 'name';
@@ -404,20 +431,33 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 			$name = $userInfo[$nameField] ?? '';
 		}
 
+		$issuer = (string) ($tokenClaims['iss'] ?? $userInfo['iss'] ?? $cfg['issuer'] ?? $providerId);
+		$subject = (string) ($tokenClaims['sub'] ?? $userInfo['sub'] ?? $userInfo['id'] ?? $userInfo['login'] ?? '');
+		if($subject === '') {
+			throw new WireException("OIDC: could not retrieve a stable subject identifier from {$cfg['label']}");
+		}
+
 		// ---- Step 5: hookable identity resolution ----
 		$identity = $this->resolveIdentity([
-			'email'    => $email,
-			'name'     => (string) $name,
-			'provider' => $providerId,
-			'raw'      => $userInfo,
+			'email'          => $email,
+			'email_verified' => $emailVerified,
+			'name'           => (string) $name,
+			'provider'       => $providerId,
+			'issuer'         => $issuer,
+			'subject'        => $subject,
+			'raw'            => $userInfo,
+			'id_token'       => $tokenClaims,
 		]);
 
 		if(empty($identity['email'])) {
 			throw new WireException('OIDC: identity resolution returned empty email');
 		}
+		if(empty($identity['subject'])) {
+			throw new WireException('OIDC: identity resolution returned empty subject');
+		}
 
 		// ---- Step 6: login or register ----
-		$this->loginOrRegister($identity['email'], $identity['name'] ?? '', $providerId);
+		$this->loginOrRegister($identity);
 	}
 
 	// -----------------------------------------------------------------
@@ -428,7 +468,7 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 	 * Hookable. Receives resolved identity array, returns it (possibly modified).
 	 * Hook after to inspect, log, or alter identity before login/register.
 	 *
-	 * @param array $identity  ['email', 'name', 'provider', 'raw']
+	 * @param array $identity  ['email', 'name', 'provider', 'issuer', 'subject', 'raw']
 	 * @return array
 	 */
 	protected function ___resolveIdentity(array $identity): array {
@@ -466,8 +506,9 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 	 * @param string $email
 	 * @param string $name
 	 * @param string $provider
+	 * @param array  $identity
 	 */
-	protected function ___registerUser(string $email, string $name, string $provider): void {
+	protected function ___registerUser(string $email, string $name, string $provider, array $identity = []): void {
 		$sanitizer = $this->wire('sanitizer');
 		$users     = $this->wire('users');
 		$session   = $this->wire('session');
@@ -500,6 +541,15 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 
 		$users->save($user);
 		$user->of(true);
+		$this->assertUserAllowedForOidc($user, $provider);
+		if($identity) {
+			$key = $this->identityKey(
+				(string) ($identity['provider'] ?? $provider),
+				(string) ($identity['issuer'] ?? $provider),
+				(string) ($identity['subject'] ?? '')
+			);
+			$this->saveIdentityLink($key, $user, $identity);
+		}
 
 		session_regenerate_id(true);
 		$session->forceLogin($user);
@@ -538,6 +588,7 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 				'verified_field' => 'email_verified',
 				'extra_emails'   => false,
 				'oidc'           => true,
+				'pkce'           => true,
 			],
 			'github' => [
 				'label'          => 'GitHub',
@@ -552,6 +603,8 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 				'verified_field' => null,
 				'extra_emails'   => true,
 				'emails_url'     => 'https://api.github.com/user/emails',
+				'email_verified_required' => true,
+				'pkce'           => true,
 			],
 			'linkedin' => [
 				'label'          => 'LinkedIn',
@@ -559,6 +612,8 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 				'auth_url'       => 'https://www.linkedin.com/oauth/v2/authorization',
 				'token_url'      => 'https://www.linkedin.com/oauth/v2/accessToken',
 				'userinfo_url'   => 'https://api.linkedin.com/v2/userinfo',
+				'jwks_uri'       => 'https://www.linkedin.com/oauth/openid/jwks',
+				'issuer'         => 'https://www.linkedin.com/oauth',
 				'scope'          => 'openid profile email',
 				'token_type'     => 'json',
 				'email_field'    => 'email',
@@ -566,6 +621,7 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 				'verified_field' => 'email_verified',
 				'extra_emails'   => false,
 				'oidc'           => true,
+				'pkce'           => true,
 			],
 			'microsoft' => [
 				'label'          => 'Microsoft',
@@ -573,6 +629,8 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 				'auth_url'       => 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize',
 				'token_url'      => 'https://login.microsoftonline.com/common/oauth2/v2.0/token',
 				'userinfo_url'   => 'https://graph.microsoft.com/v1.0/me',
+				'jwks_uri'       => 'https://login.microsoftonline.com/common/discovery/v2.0/keys',
+				'issuer'         => 'https://login.microsoftonline.com/{tenantid}/v2.0',
 				'scope'          => 'openid email profile User.Read',
 				'token_type'     => 'json',
 				'email_field'    => 'mail',
@@ -581,6 +639,8 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 				'verified_field' => null,
 				'extra_emails'   => false,
 				'oidc'           => true,
+				'email_verified_required' => false,
+				'pkce'           => true,
 			],
 			'yandex' => [
 				'label'          => 'Yandex',
@@ -595,6 +655,8 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 				'verified_field' => null,
 				'extra_emails'   => false,
 				'oidc'           => false,
+				'email_verified_required' => false,
+				'pkce'           => true,
 			],
 			'yahoo' => [
 				'label'          => 'Yahoo',
@@ -602,6 +664,8 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 				'auth_url'       => 'https://api.login.yahoo.com/oauth2/request_auth',
 				'token_url'      => 'https://api.login.yahoo.com/oauth2/get_token',
 				'userinfo_url'   => 'https://api.login.yahoo.com/openid/v1/userinfo',
+				'jwks_uri'       => 'https://api.login.yahoo.com/openid/v1/certs',
+				'issuer'         => 'https://api.login.yahoo.com',
 				'scope'          => 'openid email profile',
 				'token_type'     => 'json',
 				'email_field'    => 'email',
@@ -609,6 +673,7 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 				'verified_field' => 'email_verified',
 				'extra_emails'   => false,
 				'oidc'           => true,
+				'pkce'           => true,
 			],
 		];
 	}
@@ -617,31 +682,119 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 	// Login / register dispatch
 	// -----------------------------------------------------------------
 
-	protected function loginOrRegister(string $email, string $name, string $provider): void {
+	protected function loginOrRegister(array $identity): void {
 		$sanitizer = $this->wire('sanitizer');
 		$users     = $this->wire('users');
 		$session   = $this->wire('session');
+		$current   = $this->wire('user');
+
+		$email    = (string) ($identity['email'] ?? '');
+		$name     = (string) ($identity['name'] ?? '');
+		$provider = (string) ($identity['provider'] ?? '');
+		$issuer   = (string) ($identity['issuer'] ?? $provider);
+		$subject  = (string) ($identity['subject'] ?? '');
+		$key      = $this->identityKey($provider, $issuer, $subject);
+
+		if($key === '') {
+			throw new WireException('OIDC: cannot login without a stable provider subject');
+		}
+
+		$linkedUser = $this->getLinkedUser($key);
+		if($linkedUser && $linkedUser->id) {
+			$this->assertUserAllowedForOidc($linkedUser, $provider);
+			session_regenerate_id(true);
+			$session->forceLogin($linkedUser);
+			$session->set('oidc_provider', $provider);
+			$this->loginUser($linkedUser, $provider);  // goes through hook system
+			return; // loginUser redirects; only reached if a hook replaces the method
+		}
+
+		// Authenticated users may explicitly link their own account.
+		if($current && $current->isLoggedin()) {
+			$this->assertUserAllowedForOidc($current, $provider);
+			if($current->email && strcasecmp((string) $current->email, $email) !== 0) {
+				throw new WireException('OIDC: provider email does not match the logged-in account');
+			}
+			$this->saveIdentityLink($key, $current, $identity);
+			$session->set('oidc_provider', $provider);
+			$this->loginUser($current, $provider);
+			return;
+		}
 
 		$existing = $users->get('include=all, email=' . $sanitizer->selectorValue($email));
 
 		if($existing && $existing->id) {
+			if(!$this->allowEmailAccountLink) {
+				throw new WireException('OIDC: an account with this email already exists; login first to link this provider');
+			}
+			if(empty($identity['email_verified'])) {
+				throw new WireException('OIDC: refusing to link an existing account by unverified email');
+			}
+			$this->assertUserAllowedForOidc($existing, $provider);
+			$this->saveIdentityLink($key, $existing, $identity);
 			session_regenerate_id(true);
 			$session->forceLogin($existing);
 			$session->set('oidc_provider', $provider);
-			$this->loginUser($existing, $provider);  // goes through hook system
-			return; // loginUser redirects; only reached if a hook replaces the method
+			$this->loginUser($existing, $provider);
+			return;
 		}
 
 		if(!$this->autoRegister) {
 			throw new Wire404Exception('OIDC: no account found and auto-registration is disabled');
 		}
 
-		$this->registerUser($email, $name, $provider);  // goes through hook system
+		$this->registerUser($email, $name, $provider, $identity);  // goes through hook system
 	}
 
 	// Note: loginUser(), registerUser(), getProviderDefs(), resolveIdentity() are all
 	// hookable (defined as ___method). Call them WITHOUT underscores — Wire's __call()
 	// dispatches through the hook system automatically.
+
+	protected function identityKey(string $provider, string $issuer, string $subject): string {
+		$provider = strtolower($this->wire('sanitizer')->name($provider));
+		$issuer   = trim($issuer);
+		$subject  = trim($subject);
+		if($provider === '' || $issuer === '' || $subject === '') return '';
+		return hash('sha256', $provider . "\n" . $issuer . "\n" . $subject);
+	}
+
+	protected function getLinkedUser(string $key): ?User {
+		$links = is_array($this->identityLinks) ? $this->identityLinks : [];
+		$userId = (int) ($links[$key]['user_id'] ?? 0);
+		if(!$userId) return null;
+		$user = $this->wire('users')->get($userId);
+		return ($user && $user->id) ? $user : null;
+	}
+
+	protected function saveIdentityLink(string $key, User $user, array $identity): void {
+		if($key === '' || !$user->id) return;
+		$links = is_array($this->identityLinks) ? $this->identityLinks : [];
+		$links[$key] = [
+			'user_id'  => (int) $user->id,
+			'provider' => (string) ($identity['provider'] ?? ''),
+			'issuer'   => (string) ($identity['issuer'] ?? ''),
+			'subject'  => (string) ($identity['subject'] ?? ''),
+			'email'    => (string) ($identity['email'] ?? ''),
+			'linked'   => time(),
+		];
+		$this->identityLinks = $links;
+		$this->wire('modules')->saveConfig($this, ['identityLinks' => $links]);
+	}
+
+	protected function assertUserAllowedForOidc(User $user, string $provider): void {
+		if($this->blockSuperuserLogin && $user->isSuperuser()) {
+			throw new WireException("OIDC: superuser login is blocked for {$provider}");
+		}
+
+		$allowed = array_filter(array_map('trim', explode(',', (string) $this->allowedLoginRoles)));
+		if(!$allowed) return;
+
+		foreach($allowed as $roleName) {
+			if($roleName !== '' && $user->hasRole($roleName)) return;
+		}
+
+		throw new WireException("OIDC: this account is not allowed to login via {$provider}");
+	}
 
 	// -----------------------------------------------------------------
 	// OIDC discovery
@@ -665,11 +818,7 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 		$cached   = $this->wire('cache')->get($cacheKey);
 		if(is_array($cached)) return $cached;
 
-		$ctx  = stream_context_create(['http' => ['timeout' => 5, 'ignore_errors' => true]]);
-		$body = @file_get_contents($url, false, $ctx);
-		if(!$body) return null;
-
-		$data = json_decode($body, true);
+		$data = $this->httpGet($url, '');
 		if(!is_array($data) || empty($data['authorization_endpoint'])) return null;
 
 		$this->wire('cache')->save($cacheKey, $data, 3600);
@@ -715,7 +864,7 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 		if(!empty($claims['nbf']) && (int) $claims['nbf'] > ($now + $leeway)) return [];
 		if(!empty($claims['iat']) && (int) $claims['iat'] > ($now + $leeway)) return [];
 
-		if(!empty($cfg['issuer']) && (($claims['iss'] ?? '') !== $cfg['issuer'])) return [];
+		if(!empty($cfg['issuer']) && !$this->issuerMatches((string) $cfg['issuer'], (string) ($claims['iss'] ?? ''))) return [];
 
 		$aud = $claims['aud'] ?? null;
 		$clientId = (string) ($cfg['client_id'] ?? '');
@@ -728,6 +877,17 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 		if($nonce && (($claims['nonce'] ?? '') !== $nonce)) return [];
 
 		return $claims;
+	}
+
+	protected function issuerMatches(string $expected, string $actual): bool {
+		if($expected === '') return true;
+		if($actual === '') return false;
+		if($expected === $actual) return true;
+		if(strpos($expected, '{tenantid}') !== false) {
+			$pattern = '~^' . str_replace('\\{tenantid\\}', '[^/]+', preg_quote($expected, '~')) . '$~';
+			return (bool) preg_match($pattern, $actual);
+		}
+		return false;
 	}
 
 	protected function decodeJwtPayload(string $jwt): array {
@@ -837,6 +997,8 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 				'Content-Type: application/x-www-form-urlencoded',
 			],
 			CURLOPT_TIMEOUT        => 10,
+			CURLOPT_SSL_VERIFYPEER => true,
+			CURLOPT_SSL_VERIFYHOST => 2,
 		]);
 		$response = (string) curl_exec($ch);
 		$error = curl_error($ch);
@@ -862,6 +1024,8 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 			CURLOPT_RETURNTRANSFER => true,
 			CURLOPT_HTTPHEADER     => $headers,
 			CURLOPT_TIMEOUT        => 10,
+			CURLOPT_SSL_VERIFYPEER => true,
+			CURLOPT_SSL_VERIFYHOST => 2,
 		]);
 		$response = (string) curl_exec($ch);
 		$error = curl_error($ch);
@@ -901,8 +1065,10 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 			'email_field'    => 'email',
 			'name_field'     => 'name',
 			'verified_field' => null,
+			'email_verified_required' => true,
 			'extra_emails'   => false,
 			'oidc'           => true,
+			'pkce'           => true,
 		];
 	}
 
@@ -925,6 +1091,13 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 
 	protected function h($value): string {
 		return htmlspecialchars((string) $value, ENT_QUOTES, 'UTF-8');
+	}
+
+	protected function truthy($value): bool {
+		if(is_bool($value)) return $value;
+		if(is_int($value) || is_float($value)) return ((float) $value) !== 0.0;
+		if(is_string($value)) return in_array(strtolower(trim($value)), ['1', 'true', 'yes', 'y', 'on'], true);
+		return false;
 	}
 
 	protected function safeCssColor(string $color): string {
@@ -952,6 +1125,10 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 				$data['providers'] = is_array($decoded)
 					? array_values(array_filter($decoded, fn($r) => !empty($r['client_id']) || !empty($r['discovery_url'])))
 					: [];
+				$e->arguments(1, $data);
+			}
+			if(!isset($data['identityLinks'])) {
+				$data['identityLinks'] = is_array($this->identityLinks) ? $this->identityLinks : [];
 				$e->arguments(1, $data);
 			}
 		});
@@ -1251,13 +1428,42 @@ HTML;
 		$f->columnWidth = 50;
 		$fs->add($f);
 
+		/** @var InputfieldCheckbox $f */
+		$f = $modules->get('InputfieldCheckbox');
+		$f->attr('name', 'allowEmailAccountLink');
+		$f->label       = 'Allow email fallback linking';
+		$f->notes       = 'Security-sensitive legacy mode. When off, an OIDC identity can only login by its provider subject link; existing email matches must login first and link explicitly.';
+		$f->attr('value', 1);
+		if($this->allowEmailAccountLink) $f->attr('checked', 'checked');
+		$f->columnWidth = 50;
+		$fs->add($f);
+
 		/** @var InputfieldText $f */
 		$f = $modules->get('InputfieldText');
 		$f->attr('name', 'newUserRole');
 		$f->label       = 'Role for new users';
 		$f->notes       = 'Role name assigned on auto-registration. Leave blank for none.';
 		$f->attr('value', $this->newUserRole);
-		$f->columnWidth = 100;
+		$f->columnWidth = 34;
+		$fs->add($f);
+
+		/** @var InputfieldCheckbox $f */
+		$f = $modules->get('InputfieldCheckbox');
+		$f->attr('name', 'blockSuperuserLogin');
+		$f->label       = 'Block superuser login';
+		$f->notes       = 'Recommended. Prevents OIDC from creating a superuser session even if a provider identity is linked.';
+		$f->attr('value', 1);
+		if($this->blockSuperuserLogin) $f->attr('checked', 'checked');
+		$f->columnWidth = 33;
+		$fs->add($f);
+
+		/** @var InputfieldText $f */
+		$f = $modules->get('InputfieldText');
+		$f->attr('name', 'allowedLoginRoles');
+		$f->label       = 'Allowed login roles';
+		$f->notes       = 'Optional comma-separated role names. Leave blank to allow any non-superuser account.';
+		$f->attr('value', $this->allowedLoginRoles);
+		$f->columnWidth = 33;
 		$fs->add($f);
 
 		$inputfields->add($fs);
