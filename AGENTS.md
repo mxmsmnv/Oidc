@@ -125,7 +125,7 @@ $wire->addHookAfter('Oidc::loginUser', function(HookEvent $e) {
 });
 ```
 
-Use `Oidc::registerUser` to take over or extend auto-registration. The fourth argument is the resolved identity array:
+Use `Oidc::registerUser` to take over or extend auto-registration. The fourth argument is the resolved identity array. The method returns the newly created `User`, available via `$e->return` in an `after` hook:
 
 ```php
 $wire->addHookBefore('Oidc::registerUser', function(HookEvent $e) {
