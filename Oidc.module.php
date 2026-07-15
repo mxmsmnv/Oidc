@@ -476,39 +476,37 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 	}
 
 	/**
-	 * Hookable. Called after forceLogin() for an existing user.
-	 * Default behaviour: redirect to loginRedirect or ?oidc_login=1.
-	 * Hook after to override the redirect destination or set session data.
+	 * Hookable. Called after forceLogin() for an existing user. Does nothing
+	 * by default — hook after to inspect the user or set session data. The
+	 * login redirect (to ?return=, loginRedirect setting, or ?oidc_login=1)
+	 * happens afterwards in loginOrRegister(), not in this method, so that
+	 * `after` hooks registered on this method actually get a chance to run
+	 * (redirecting here would exit the process first).
 	 *
 	 * @param User   $user
 	 * @param string $provider
 	 */
 	protected function ___loginUser(User $user, string $provider): void {
-		$session = $this->wire('session');
-
-		// ?return= takes precedence, then module setting, then fallback
-		$returnUrl = (string) $session->getFor($this, 'oidc_return');
-		$session->removeFor($this, 'oidc_return');
-
-		$dest = $this->safeRedirectUrl($returnUrl)
-			?: $this->safeRedirectUrl($this->loginRedirect)
-			?: $this->wire('page')->url . '?oidc_login=1';
-
-		$session->redirect($dest);
 	}
 
 	/**
 	 * Hookable. Called when no existing user matches the email.
 	 * Only fires when autoRegister is true.
-	 * Hook before with $e->replace = true to handle registration yourself.
-	 * Hook after to modify the created user or change the redirect.
+	 * Hook before with $e->replace = true to handle registration yourself. In
+	 * that case you are responsible for logging the user in (and redirecting,
+	 * if desired; loginOrRegister() only redirects when this method itself
+	 * doesn't).
+	 * Hook after to inspect or modify the created user via $e->return; the
+	 * login redirect happens afterwards in loginOrRegister(), not in this
+	 * method.
 	 *
 	 * @param string $email
 	 * @param string $name
 	 * @param string $provider
 	 * @param array  $identity
+	 * @return User The newly created user.
 	 */
-	protected function ___registerUser(string $email, string $name, string $provider, array $identity = []): void {
+	protected function ___registerUser(string $email, string $name, string $provider, array $identity = []): User {
 		$sanitizer = $this->wire('sanitizer');
 		$users     = $this->wire('users');
 		$session   = $this->wire('session');
@@ -555,14 +553,7 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 		$session->forceLogin($user);
 		$session->set('oidc_provider', $provider);
 
-		$returnUrl = (string) $session->getFor($this, 'oidc_return');
-		$session->removeFor($this, 'oidc_return');
-
-		$dest = $this->safeRedirectUrl($returnUrl)
-			?: $this->safeRedirectUrl($this->loginRedirect)
-			?: $this->wire('page')->url . '?oidc_registered=1';
-
-		$session->redirect($dest);
+		return $user;
 	}
 
 	/**
@@ -706,7 +697,8 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 			$session->forceLogin($linkedUser);
 			$session->set('oidc_provider', $provider);
 			$this->loginUser($linkedUser, $provider);  // goes through hook system
-			return; // loginUser redirects; only reached if a hook replaces the method
+			$this->redirectAfterLogin('?oidc_login=1');
+			return;
 		}
 
 		// Authenticated users may explicitly link their own account.
@@ -717,7 +709,8 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 			}
 			$this->saveIdentityLink($key, $current, $identity);
 			$session->set('oidc_provider', $provider);
-			$this->loginUser($current, $provider);
+			$this->loginUser($current, $provider);  // goes through hook system
+			$this->redirectAfterLogin('?oidc_login=1');
 			return;
 		}
 
@@ -735,7 +728,8 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 			session_regenerate_id(true);
 			$session->forceLogin($existing);
 			$session->set('oidc_provider', $provider);
-			$this->loginUser($existing, $provider);
+			$this->loginUser($existing, $provider);  // goes through hook system
+			$this->redirectAfterLogin('?oidc_login=1');
 			return;
 		}
 
@@ -744,6 +738,30 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 		}
 
 		$this->registerUser($email, $name, $provider, $identity);  // goes through hook system
+		$this->redirectAfterLogin('?oidc_registered=1');
+	}
+
+	/**
+	 * Redirect after a successful login or registration. Called after
+	 * loginUser()/registerUser() return, so `after` hooks registered on
+	 * either of those get a chance to run before the process exits via
+	 * Session::redirect().
+	 *
+	 * @param string $fallbackQuery Query string appended to the current page
+	 *   URL when no ?return= or loginRedirect setting is configured.
+	 */
+	protected function redirectAfterLogin(string $fallbackQuery): void {
+		$session = $this->wire('session');
+
+		// ?return= takes precedence, then module setting, then fallback
+		$returnUrl = (string) $session->getFor($this, 'oidc_return');
+		$session->removeFor($this, 'oidc_return');
+
+		$dest = $this->safeRedirectUrl($returnUrl)
+			?: $this->safeRedirectUrl($this->loginRedirect)
+			?: $this->wire('page')->url . $fallbackQuery;
+
+		$session->redirect($dest);
 	}
 
 	// Note: loginUser(), registerUser(), getProviderDefs(), resolveIdentity() are all

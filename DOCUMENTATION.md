@@ -9,8 +9,8 @@ Generic OIDC: **Okta, Auth0, Keycloak, authentik, Azure AD**, and any provider w
 
 **Repository:** [github.com/mxmsmnv/Oidc](https://github.com/mxmsmnv/Oidc)
 
-**Author:** Maxim Semenov  
-**Website:** [smnv.org](https://smnv.org)  
+**Author:** Maxim Semenov
+**Website:** [smnv.org](https://smnv.org)
 **Email:** [maxim@smnv.org](mailto:maxim@smnv.org)
 
 If this project helps your work, consider supporting future development: [GitHub Sponsors](https://github.com/sponsors/mxmsmnv) or [smnv.org/sponsor](https://smnv.org/sponsor/).
@@ -303,7 +303,7 @@ One custom provider configured directly in module settings. Suitable for Okta, A
 6. If no link exists and the visitor is already logged in, the module links that provider identity to the current account
 7. If no link exists and a local user already has the same email, login is blocked by default; enable **Allow email fallback linking** only as an explicit legacy opt-in
 8. If no link exists and no local email match exists, the module auto-registers a new user when enabled
-9. `loginUser` or `registerUser` hook fires → redirect to destination
+9. `loginUser` (or, for new accounts, `registerUser`) hook fires, then the module redirects to the destination
 
 For OIDC providers, returned `id_token` claims are accepted only after RS256 signature verification and standard claim checks (`iss`, `aud`, expiry, and `nonce`). If an OIDC provider returns an `id_token` that cannot be verified, login fails closed instead of silently falling back to UserInfo.
 
@@ -331,7 +331,7 @@ $wire->addHookAfter('Oidc::resolveIdentity', function(HookEvent $e) {
 
 ### `Oidc::loginUser`
 
-Fires after `forceLogin()` for an existing user. Default behaviour: redirect to `loginRedirect` setting or `?oidc_login=1`. Hook `after` to override.
+Fires after `forceLogin()` for an existing user. Does nothing by default, the login redirect (to `?return=`, the `loginRedirect` setting, or `?oidc_login=1`) happens afterwards, once this method returns, not inside it. Hook `after` to inspect the user, set session data, or redirect somewhere else yourself (a redirect inside the hook takes over, since it ends the request before the module's own redirect runs).
 
 ```php
 $wire->addHookAfter('Oidc::loginUser', function(HookEvent $e) {
@@ -344,7 +344,15 @@ $wire->addHookAfter('Oidc::loginUser', function(HookEvent $e) {
 
 ### `Oidc::registerUser`
 
-Fires when no provider identity link exists, no existing local account blocks registration, and `autoRegister` is enabled. Hook `before` with `$e->replace = true` to take over completely, or hook `after` to modify the result. The fourth argument contains the resolved identity array.
+Fires when no provider identity link exists, no existing local account blocks registration, and `autoRegister` is enabled. Returns the newly created `User`. Hook `before` with `$e->replace = true` to take over completely, you're responsible for logging the user in yourself. `loginOrRegister()` still redirects afterwards to the usual destination unless your hook has already redirected (which ends the request immediately). Hook `after` to inspect or modify the created user via `$e->return`; the redirect always happens afterwards, once this method returns, not inside it. The fourth argument contains the resolved identity array.
+
+```php
+$wire->addHookAfter('Oidc::registerUser', function(HookEvent $e) {
+    $user = $e->return; // the newly created User
+
+    $e->wire('log')->save('oidc', "Registered {$user->name} ({$user->email})");
+});
+```
 
 ```php
 $wire->addHookBefore('Oidc::registerUser', function(HookEvent $e) {
