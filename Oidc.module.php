@@ -778,7 +778,7 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 			'linked'   => time(),
 		];
 		$this->identityLinks = $links;
-		$this->wire('modules')->saveConfig($this, ['identityLinks' => $links]);
+		$this->wire('modules')->saveConfig($this, 'identityLinks', $links);
 	}
 
 	protected function assertUserAllowedForOidc(User $user, string $provider): void {
