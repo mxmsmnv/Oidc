@@ -1408,7 +1408,7 @@ HTML;
 		$f->label       = 'Protected path';
 		$f->notes       = 'If set, silent mode only applies to pages whose URL starts with this path, e.g. /account/. Leave blank to protect the entire site.';
 		$f->attr('value', $this->silentPath);
-		$f->columnWidth = 45;
+		$f->columnWidth = 47;
 		$fs->add($f);
 
 		// Default provider for silent mode and renderButtons() ordering
@@ -1422,7 +1422,7 @@ HTML;
 			$f->addOption($pid, $pcfg['label']);
 		}
 		$f->attr('value', $this->defaultProvider ?: '');
-		$f->columnWidth = 32;
+		$f->columnWidth = 33;
 		$fs->add($f);
 
 		/** @var InputfieldRadios $f */
@@ -1433,7 +1433,7 @@ HTML;
 		$f->addOption('icon', 'Icons only');
 		$f->attr('value', $this->buttonStyle ?: 'full');
 		$f->optionColumns = 1;
-		$f->columnWidth   = 50;
+		$f->columnWidth   = 34;
 		$fs->add($f);
 
 		/** @var InputfieldCheckbox $f */
@@ -1443,7 +1443,7 @@ HTML;
 		$f->notes       = 'When off, unknown emails throw a 404. Hook ___registerUser() to implement custom registration logic.';
 		$f->attr('value', 1);
 		if($this->autoRegister) $f->attr('checked', 'checked');
-		$f->columnWidth = 50;
+		$f->columnWidth = 33;
 		$fs->add($f);
 
 		/** @var InputfieldCheckbox $f */
@@ -1453,7 +1453,7 @@ HTML;
 		$f->notes       = 'Security-sensitive legacy mode. When off, an OIDC identity can only login by its provider subject link; existing email matches must login first and link explicitly.';
 		$f->attr('value', 1);
 		if($this->allowEmailAccountLink) $f->attr('checked', 'checked');
-		$f->columnWidth = 50;
+		$f->columnWidth = 33;
 		$fs->add($f);
 
 		/** @var InputfieldText $f */
