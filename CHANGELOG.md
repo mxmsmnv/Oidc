@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.3
+
+- Fixed the OIDC settings grid so each row's column widths add up correctly and no longer shift fields out of alignment.
+
 ## 1.1.2
 
 - Changed account matching to use stable provider identity links (`provider + issuer + subject`) instead of email-only matching.

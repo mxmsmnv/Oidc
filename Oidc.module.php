@@ -76,7 +76,7 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 		return [
 			'title'    => 'Oidc',
 			'summary'  => 'OAuth 2.0 / OpenID Connect: Google, GitHub, LinkedIn, Microsoft, Yandex, Yahoo, and any OIDC-compatible provider.',
-			'version'  => 112,
+			'version'  => 113,
 			'icon'     => 'key',
 			'author'   => 'Maxim Semenov',
 			'href'     => 'https://smnv.org',
