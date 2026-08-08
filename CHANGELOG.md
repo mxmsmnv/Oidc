@@ -11,6 +11,7 @@
 - Fixed verified-email handling for generic OIDC providers and preserved validated ID-token claims when UserInfo supplements them.
 - Hardened local return URL validation against encoded separators, backslashes, control characters, and external redirects.
 - Added standalone security regression tests for token tampering, required claims, audience/`azp`, nonce, expiry, state replay, parallel flows, error callbacks, JWK policy, and return URLs.
+- Kept the module settings form renderable in CLI and non-HTTPS maintenance contexts while retaining strict HTTPS enforcement in the real authorization flow.
 
 ## 1.1.3
 

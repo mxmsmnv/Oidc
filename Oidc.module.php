@@ -1385,7 +1385,10 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 
 		$jsonFlags   = JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP;
 		$rowsJson    = json_encode($rows, $jsonFlags);
-		$callbackUrl = json_encode($this->resolveCallbackUrl(), $jsonFlags);
+		// This value is display-only. The actual authorization flow validates
+		// the resolved callback as HTTPS before using it.
+		$callbackPreview = trim((string) $this->callbackUrl) ?: $this->wire('page')->httpUrl();
+		$callbackUrl = json_encode($callbackPreview, $jsonFlags);
 
 		// ---- Providers fieldset ----
 		/** @var InputfieldFieldset $fs */
