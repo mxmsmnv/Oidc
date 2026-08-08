@@ -46,7 +46,35 @@ $oidc = $modules->get('Oidc');
 echo $oidc->renderButtons();
 ```
 
-The page that renders the buttons is also the callback page. Set its full URL in **Settings → Callback URL** and register the same URL in each provider's OAuth application settings.
+The page that renders the buttons is also the callback page. Set its full URL in **Settings → Callback URL** and register the exact generated redirect URI, including `?oidc=<provider-id>`, in each provider's OAuth application settings.
+
+OIDC callbacks use one-time state-scoped transactions with a 10-minute TTL. The registered redirect URI includes the provider query parameter, for example `https://yoursite.com/login/?oidc=company`; use exact-match redirect validation at the provider.
+
+### Private runtime credentials
+
+Module settings can retain credentials for backwards compatibility. Security-sensitive deployments should keep secrets out of the ProcessWire database. In a private, untracked environment configuration file:
+
+```php
+$config->oidcRequireRuntimeCredentials = true;
+$config->oidcProviders = [
+    'company' => [
+        'label' => 'Company ID',
+        'client_id' => getenv('OIDC_CLIENT_ID'),
+        'client_secret' => getenv('OIDC_CLIENT_SECRET'),
+        'discovery_url' => 'https://id.example.com',
+        'scope' => 'openid email profile',
+    ],
+];
+$config->oidcAllowedIssuers = ['https://id.example.com'];
+```
+
+With `oidcRequireRuntimeCredentials` enabled, credentials saved in module settings cannot enable a provider. Do not commit the private configuration file or environment values.
+
+Discovery is fail closed: issuers require an exact allow-list entry, all endpoints must use public HTTPS addresses, and discovered endpoints must share the issuer origin. If a legitimate provider uses another origin, list only that exact origin:
+
+```php
+$config->oidcAllowedEndpointOrigins = ['https://keys.example-cdn.com'];
+```
 
 ---
 
@@ -243,6 +271,8 @@ No hook needed for standard OIDC providers. In **Modules → Oidc → Custom OID
 | Client Secret | your app client secret |
 | Discovery URL | `https://your-org.okta.com` |
 
+Also add the exact issuer to `$config->oidcAllowedIssuers`. Generic OIDC expects the standard `email_verified` claim and rejects unverified email addresses.
+
 The module appends `/.well-known/openid-configuration` and auto-fetches all endpoints. The same approach works for:
 
 | IdP | Discovery URL |
@@ -295,8 +325,8 @@ One custom provider configured directly in module settings. Suitable for Okta, A
 
 ## Redirect flow
 
-1. User clicks a button → `?oidc=google` → module redirects to provider authorization URL with CSRF `state`, OIDC `nonce`, and S256 PKCE where configured
-2. Provider redirects back to callback URL with `?code&state`
+1. User clicks a button → `?oidc=google` → module creates a one-time transaction and redirects with CSRF `state`, OIDC `nonce`, and S256 PKCE where configured
+2. Provider redirects back to callback URL with `?code&state`; the transaction is consumed before either success or error processing, preventing replay
 3. Module verifies state, handles provider errors, exchanges code for token, resolves identity
 4. `resolveIdentity` hook fires — inspect or modify the identity
 5. Module looks up an existing provider identity link by `provider + issuer + subject`

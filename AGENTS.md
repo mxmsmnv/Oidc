@@ -32,12 +32,14 @@ For a normal public website with a login page:
 2. Create or identify a login page, commonly `/login/`.
 3. Render provider buttons in that page template with `renderButtons()`.
 4. Set the module Callback URL to the full URL of that same login page.
-5. Register the same callback URL in each OAuth/OIDC provider application.
+5. Register the exact generated callback URL, including `?oidc=<provider-id>`, in each OAuth/OIDC provider application.
 6. Configure one or more providers in the module settings.
 7. Protect private pages by redirecting anonymous users to `/login/?return=...`.
 8. Use `?return=` to send users back after login, or set Redirect after login in module settings.
 
 Important security behavior: first-time OIDC login does not silently attach to an existing local user by email. The module links users by stable provider identity (`provider + issuer + subject`). If a local account with the same email already exists, the user should login locally first and then use the OIDC button as an explicit linking action.
+
+For security-sensitive deployments, keep client credentials in a private runtime configuration rather than module settings. Set `$config->oidcRequireRuntimeCredentials = true`, define provider rows in `$config->oidcProviders`, and explicitly allow discovery issuers with `$config->oidcAllowedIssuers`. Never commit that private configuration.
 
 Canonical template usage:
 

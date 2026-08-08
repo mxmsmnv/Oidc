@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.2.0
+
+- Made OIDC authentication fail closed unless a signed `id_token` contains valid `iss`, `aud`, `exp`, `sub`, and `nonce` claims; added `azp` validation for multiple audiences.
+- Replaced provider-wide state slots with one-time, state-scoped transactions with a 10-minute TTL, replay protection, cleanup, and parallel-tab support.
+- Validated `state` before handling provider error callbacks and changed authorization/login redirects to temporary HTTP statuses.
+- Added private runtime provider credentials through `$config->oidcProviders` and an `oidcRequireRuntimeCredentials` mode that prevents database credentials from enabling providers.
+- Required explicit issuer allow-lists for discovery, same-origin discovered endpoints by default, public HTTPS endpoint resolution, and short connection timeouts.
+- Tightened RS256 JWK selection to require `kid`, signing use, matching algorithm and verify operations; refreshes JWKS once when an unknown key ID indicates rotation.
+- Fixed verified-email handling for generic OIDC providers and preserved validated ID-token claims when UserInfo supplements them.
+- Hardened local return URL validation against encoded separators, backslashes, control characters, and external redirects.
+- Added standalone security regression tests for token tampering, required claims, audience/`azp`, nonce, expiry, state replay, parallel flows, error callbacks, JWK policy, and return URLs.
+
 ## 1.1.3
 
 - Fixed the OIDC settings grid so each row's column widths add up correctly and no longer shift fields out of alignment.

@@ -20,8 +20,8 @@ If this project helps your work, consider supporting future development: [GitHub
 - Supports custom OIDC providers through discovery URLs.
 - Works with Okta, Auth0, Keycloak, authentik, Azure AD, Dex and similar providers.
 - Handles OAuth callbacks automatically on frontend pages.
-- Verifies OIDC `id_token` claims with nonce, issuer, audience, expiry and RS256/JWKS checks.
-- Falls back to UserInfo for providers that expose identity through API endpoints.
+- Requires and verifies OIDC `id_token` claims with nonce, issuer, audience, expiry, subject and strict RS256/JWKS checks.
+- Supplements validated ID-token claims from UserInfo when required profile fields are absent.
 - Links local users by stable provider identity (`issuer` + `subject`) instead of email-only matching.
 - Auto-registers new ProcessWire users or lets hooks take over registration.
 - Blocks superuser OIDC login by default and supports role allow-lists.
@@ -32,6 +32,23 @@ If this project helps your work, consider supporting future development: [GitHub
 ## Provider Setup
 
 Oidc includes a provider table in the module settings. Fill the Client ID and Client Secret for any built-in provider to enable it.
+
+For deployments where secrets must remain outside the ProcessWire database, provide credentials from a private, untracked configuration file and require runtime credentials:
+
+```php
+$config->oidcRequireRuntimeCredentials = true;
+$config->oidcProviders = [
+    'company' => [
+        'client_id' => getenv('OIDC_CLIENT_ID'),
+        'client_secret' => getenv('OIDC_CLIENT_SECRET'),
+        'discovery_url' => 'https://id.example.com',
+        'label' => 'Company ID',
+    ],
+];
+$config->oidcAllowedIssuers = ['https://id.example.com'];
+```
+
+Never commit the runtime file or secret. Discovery issuers must be explicitly allow-listed. Discovered authorization, token, UserInfo and JWKS endpoints must share the issuer origin unless their origins are explicitly listed in `$config->oidcAllowedEndpointOrigins`.
 
 For standard OpenID Connect providers, configure one custom provider with:
 
@@ -54,7 +71,7 @@ $oidc = $modules->get('Oidc');
 echo $oidc->renderButtons();
 ```
 
-The page that renders the buttons is also the callback page. Register that URL in each provider's OAuth application settings.
+The page that renders the buttons is also the callback page. Register the exact generated redirect URI, including `?oidc=<provider-id>`, in each provider's OAuth application settings.
 
 ## Installation
 
@@ -69,6 +86,8 @@ The page that renders the buttons is also the callback page. Register that URL i
 See [DOCUMENTATION.md](DOCUMENTATION.md) for setup, configuration, provider notes, hooks and template integration examples.
 
 See [CHANGELOG.md](CHANGELOG.md) for the release notes.
+
+Run the dependency-free security test suite with `php tests/run.php`.
 
 ## Author
 

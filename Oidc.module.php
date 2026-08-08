@@ -72,11 +72,15 @@
  */
 class Oidc extends WireData implements Module, ConfigurableModule {
 
+	private const TRANSACTION_TTL = 600;
+	private const HTTP_TIMEOUT = 10;
+	private const HTTP_CONNECT_TIMEOUT = 3;
+
 	public static function getModuleInfo(): array {
 		return [
 			'title'    => 'Oidc',
 			'summary'  => 'OAuth 2.0 / OpenID Connect: Google, GitHub, LinkedIn, Microsoft, Yandex, Yahoo, and any OIDC-compatible provider.',
-			'version'  => 113,
+			'version'  => 120,
 			'icon'     => 'key',
 			'author'   => 'Maxim Semenov',
 			'href'     => 'https://smnv.org',
@@ -211,12 +215,27 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 	public function getEnabledProviders(): array {
 		$defs  = $this->getProviderDefs();   // goes through hook system
 		$saved = is_array($this->providers) ? $this->providers : [];
-		$out   = [];
-
+		$runtime = $this->runtimeProviders();
+		$rowsById = [];
 		foreach($saved as $row) {
+			$id = strtolower($this->wire('sanitizer')->name((string) ($row['id'] ?? '')));
+			if($id !== '') $rowsById[$id] = $row;
+		}
+		foreach($runtime as $id => $row) {
+			$rowsById[$id] = array_merge($rowsById[$id] ?? ['id' => $id], $row, [
+				'id' => $id,
+				'_runtime' => true,
+				'_runtime_client_id' => $row['client_id'] ?? '',
+				'_runtime_client_secret' => $row['client_secret'] ?? '',
+			]);
+		}
+		$out   = [];
+		$requireRuntime = (bool) ($this->wire('config')->oidcRequireRuntimeCredentials ?? false);
+
+		foreach($rowsById as $row) {
 			$id     = trim($row['id'] ?? '');
-			$cid    = trim($row['client_id'] ?? '');
-			$secret = trim($row['client_secret'] ?? '');
+			$cid = trim($requireRuntime ? ($row['_runtime_client_id'] ?? '') : ($row['client_id'] ?? ''));
+			$secret = trim($requireRuntime ? ($row['_runtime_client_secret'] ?? '') : ($row['client_secret'] ?? ''));
 			if(!$id || !$cid || !$secret) continue;
 
 			$def = $defs[$id] ?? $this->genericDef($row);
@@ -225,7 +244,9 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 			$discoveryUrl = trim($row['discovery_url'] ?? '');
 			if($discoveryUrl) {
 				$disc = $this->oidcDiscover($discoveryUrl);
-				if($disc) {
+				if(!$disc) {
+					throw new WireException("OIDC: discovery failed or is not allowed for {$id}");
+				} else {
 					$def['auth_url']     = $disc['authorization_endpoint'] ?? $def['auth_url'];
 					$def['token_url']    = $disc['token_endpoint']         ?? $def['token_url'];
 					$def['userinfo_url'] = $disc['userinfo_endpoint']      ?? ($def['userinfo_url'] ?? '');
@@ -233,6 +254,9 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 					$def['issuer']       = $disc['issuer']                 ?? '';
 					$def['scope']        = $row['scope'] ?? $def['scope']  ?? 'openid email profile';
 					$def['oidc']         = true;
+					$def['pkce']         = true;
+					$def['verified_field'] = $def['verified_field'] ?? 'email_verified';
+					$this->assertProviderEndpoints($def);
 				}
 			}
 
@@ -259,10 +283,9 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 		}
 
 		$cfg         = $providers[$providerId];
+		$this->assertSafeHttpsUrl((string) ($cfg['auth_url'] ?? ''));
 		$input       = $this->wire('input');
 		$session     = $this->wire('session');
-		$stateKey    = 'oidc_state_' . $providerId;
-		$nonceKey    = 'oidc_nonce_' . $providerId;
 		$callbackUrl = $this->resolveCallbackUrl();
 		// Strip any existing ?oidc= or &oidc= from callbackUrl before appending
 		$callbackBase = preg_replace('/([?&])oidc=[^&]*(&|$)/', '$1', rtrim($callbackUrl, '?&'));
@@ -272,19 +295,18 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 			. 'oidc=' . $providerId;
 
 		// ---- Step 1: redirect to provider ----
-		if($input->get('error')) {
-			$error = (string) $input->get('error');
-			$description = (string) $input->get('error_description');
-			throw new WireException('OIDC: provider returned error ' . $error . ($description ? " ({$description})" : ''));
-		}
-
-		if(!$input->get('code')) {
+		if(!$input->get('code') && !$input->get('error')) {
 			$state = bin2hex(random_bytes(16));
-			$session->setFor($this, $stateKey, $state);
-
-			// Preserve ?return= so we can redirect back after login
 			$returnUrl = (string) ($input->get('return') ?? '');
-			if($returnUrl) $session->setFor($this, 'oidc_return', $returnUrl);
+			$nonce = bin2hex(random_bytes(16));
+			$verifier = rtrim(strtr(base64_encode(random_bytes(32)), '+/', '-_'), '=');
+			$this->storeTransaction($state, [
+				'provider' => $providerId,
+				'nonce' => $nonce,
+				'code_verifier' => $verifier,
+				'return' => $this->safeRedirectUrl($returnUrl),
+				'created' => time(),
+			]);
 
 			$params = [
 				'client_id'     => $cfg['client_id'],
@@ -295,30 +317,33 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 			];
 
 			if(!empty($cfg['oidc'])) {
-				$nonce = bin2hex(random_bytes(16));
-				$session->setFor($this, $nonceKey, $nonce);
 				$params['nonce'] = $nonce;
 			}
 
 			if(!empty($cfg['pkce'])) {
-				$verifier  = rtrim(strtr(base64_encode(random_bytes(32)), '+/', '-_'), '=');
 				$challenge = rtrim(strtr(base64_encode(hash('sha256', $verifier, true)), '+/', '-_'), '=');
-				$session->setFor($this, 'oidc_pkce_' . $providerId, $verifier);
 				$params['code_challenge']        = $challenge;
 				$params['code_challenge_method'] = 'S256';
 			}
 
-			$session->redirect($cfg['auth_url'] . '?' . http_build_query($params));
+			$session->redirect($cfg['auth_url'] . '?' . http_build_query($params), 302);
 		}
 
-		// ---- Step 2: verify state ----
+		// ---- Step 2: consume and verify the one-time transaction ----
 		$returnedState = (string) $input->get('state');
-		$storedState   = (string) $session->getFor($this, $stateKey);
-		$session->removeFor($this, $stateKey);
-
-		if(!$returnedState || !$storedState || !hash_equals($storedState, $returnedState)) {
+		$transaction = $this->consumeTransaction($returnedState, $providerId);
+		if(!$transaction) {
 			throw new WireException('OIDC: state mismatch — possible CSRF attempt');
 		}
+		if(!empty($transaction['return'])) {
+			$session->setFor($this, 'oidc_return', (string) $transaction['return']);
+		}
+		if($input->get('error')) {
+			$error = substr($sanitizer->name((string) $input->get('error')), 0, 80);
+			$description = substr($sanitizer->text((string) $input->get('error_description')), 0, 240);
+			throw new WireException('OIDC: provider returned error ' . $error . ($description ? " ({$description})" : ''));
+		}
+		if(!$input->get('code')) throw new WireException('OIDC: authorization code is missing');
 
 		// ---- Step 3: exchange code for token ----
 		$tokenParams = [
@@ -330,9 +355,8 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 		];
 
 		if(!empty($cfg['pkce'])) {
-			$pkceKey = 'oidc_pkce_' . $providerId;
-			$tokenParams['code_verifier'] = (string) $session->getFor($this, $pkceKey);
-			$session->removeFor($this, $pkceKey);
+			$tokenParams['code_verifier'] = (string) ($transaction['code_verifier'] ?? '');
+			if($tokenParams['code_verifier'] === '') throw new WireException('OIDC: PKCE verifier is missing');
 		}
 
 		$tokenResp = $this->httpPost($cfg['token_url'], $tokenParams, $cfg['token_type'] ?? 'json');
@@ -350,18 +374,12 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 		// OIDC: validate id_token claims first (avoids an extra HTTP call)
 		$tokenClaims = [];
 		if(!empty($cfg['oidc'])) {
-			$nonce = (string) $session->getFor($this, $nonceKey);
-			$session->removeFor($this, $nonceKey);
-			if(!empty($tokenResp['id_token'])) {
-				if(empty($cfg['jwks_uri'])) {
-					throw new WireException("OIDC: cannot verify id_token for {$cfg['label']} because jwks_uri is missing");
-				}
-				$tokenClaims = $this->validateIdToken($tokenResp['id_token'], $cfg, $nonce);
-				if(!$tokenClaims) {
-					throw new WireException("OIDC: id_token validation failed for {$cfg['label']}");
-				}
-				$userInfo = $tokenClaims;
-			}
+			$nonce = (string) ($transaction['nonce'] ?? '');
+			if(empty($tokenResp['id_token'])) throw new WireException("OIDC: id_token is required for {$cfg['label']}");
+			if(empty($cfg['jwks_uri'])) throw new WireException("OIDC: cannot verify id_token for {$cfg['label']} because jwks_uri is missing");
+			$tokenClaims = $this->validateIdToken($tokenResp['id_token'], $cfg, $nonce);
+			if(!$tokenClaims) throw new WireException("OIDC: id_token validation failed for {$cfg['label']}");
+			$userInfo = $tokenClaims;
 		}
 
 		// Facebook: token as query param, not Bearer
@@ -371,7 +389,7 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 		} elseif(!empty($cfg['userinfo_url'])) {
 			$emailField = $cfg['email_field'] ?? 'email';
 			if(empty($userInfo[$emailField])) {
-				$userInfo = $this->httpGet($cfg['userinfo_url'], $accessToken);
+				$userInfo = array_merge($tokenClaims, $this->httpGet($cfg['userinfo_url'], $accessToken));
 			}
 		}
 
@@ -761,7 +779,7 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 			?: $this->safeRedirectUrl($this->loginRedirect)
 			?: $this->wire('page')->url . $fallbackQuery;
 
-		$session->redirect($dest);
+		$session->redirect($dest, 303);
 	}
 
 	// Note: loginUser(), registerUser(), getProviderDefs(), resolveIdentity() are all
@@ -826,18 +844,38 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 	 * @return array|null Parsed document, or null on failure
 	 */
 	public function oidcDiscover(string $issuerUrl): ?array {
-		$url = rtrim($issuerUrl, '/');
+		$issuer = rtrim($issuerUrl, '/');
+		if(!$this->issuerIsAllowed($issuer)) return null;
+		$this->assertSafeHttpsUrl($issuer);
+		$url = $issuer;
 		if(strpos($url, '.well-known') === false) {
 			$url .= '/.well-known/openid-configuration';
 		}
-		if(!preg_match('~^https://~i', $url)) return null;
+		$this->assertSafeHttpsUrl($url);
 
 		$cacheKey = 'oidc_disc_' . md5($url);
 		$cached   = $this->wire('cache')->get($cacheKey);
-		if(is_array($cached)) return $cached;
+		if(is_array($cached) && rtrim((string) ($cached['issuer'] ?? ''), '/') === $issuer) {
+			$this->assertProviderEndpoints([
+				'issuer' => $cached['issuer'] ?? '',
+				'auth_url' => $cached['authorization_endpoint'] ?? '',
+				'token_url' => $cached['token_endpoint'] ?? '',
+				'userinfo_url' => $cached['userinfo_endpoint'] ?? '',
+				'jwks_uri' => $cached['jwks_uri'] ?? '',
+			]);
+			return $cached;
+		}
 
 		$data = $this->httpGet($url, '');
 		if(!is_array($data) || empty($data['authorization_endpoint'])) return null;
+		if(rtrim((string) ($data['issuer'] ?? ''), '/') !== $issuer) return null;
+		$this->assertProviderEndpoints([
+			'issuer' => $data['issuer'] ?? '',
+			'auth_url' => $data['authorization_endpoint'] ?? '',
+			'token_url' => $data['token_endpoint'] ?? '',
+			'userinfo_url' => $data['userinfo_endpoint'] ?? '',
+			'jwks_uri' => $data['jwks_uri'] ?? '',
+		]);
 
 		$this->wire('cache')->save($cacheKey, $data, 3600);
 		return $data;
@@ -865,10 +903,11 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 		$claims = $this->decodeJwtPart($parts[1]);
 		if(!$header || !$claims) return [];
 
-		$alg = $header['alg'] ?? '';
-		if($alg !== 'RS256') return [];
+		$alg = (string) ($header['alg'] ?? '');
+		$kid = (string) ($header['kid'] ?? '');
+		if($alg !== 'RS256' || $kid === '') return [];
 
-		$key = $this->getJwksPublicKey((string) $cfg['jwks_uri'], (string) ($header['kid'] ?? ''));
+		$key = $this->getJwksPublicKey((string) $cfg['jwks_uri'], $kid);
 		if(!$key) return [];
 
 		$signed = $parts[0] . '.' . $parts[1];
@@ -878,21 +917,28 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 
 		$now = time();
 		$leeway = 60;
-		if(!empty($claims['exp']) && (int) $claims['exp'] < ($now - $leeway)) return [];
+		foreach(['iss', 'aud', 'exp', 'sub', 'nonce'] as $required) {
+			if(!array_key_exists($required, $claims) || $claims[$required] === '' || $claims[$required] === null) return [];
+		}
+		if(!is_int($claims['exp']) && !(is_string($claims['exp']) && ctype_digit($claims['exp']))) return [];
+		if((int) $claims['exp'] < ($now - $leeway)) return [];
 		if(!empty($claims['nbf']) && (int) $claims['nbf'] > ($now + $leeway)) return [];
 		if(!empty($claims['iat']) && (int) $claims['iat'] > ($now + $leeway)) return [];
 
-		if(!empty($cfg['issuer']) && !$this->issuerMatches((string) $cfg['issuer'], (string) ($claims['iss'] ?? ''))) return [];
+		if(empty($cfg['issuer']) || !$this->issuerMatches((string) $cfg['issuer'], (string) $claims['iss'])) return [];
 
 		$aud = $claims['aud'] ?? null;
 		$clientId = (string) ($cfg['client_id'] ?? '');
 		if(is_array($aud)) {
-			if(!in_array($clientId, $aud, true)) return [];
+			if(!$aud || !in_array($clientId, $aud, true)) return [];
+			if(count($aud) > 1 && (($claims['azp'] ?? null) !== $clientId)) return [];
 		} elseif($aud !== $clientId) {
 			return [];
 		}
+		if(isset($claims['azp']) && $claims['azp'] !== $clientId) return [];
 
-		if($nonce && (($claims['nonce'] ?? '') !== $nonce)) return [];
+		if(!hash_equals($nonce, (string) $claims['nonce'])) return [];
+		if(!is_string($claims['sub']) || trim($claims['sub']) === '') return [];
 
 		return $claims;
 	}
@@ -925,19 +971,38 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 
 	protected function getJwksPublicKey(string $jwksUri, string $kid): string {
 		if(!preg_match('~^https://~i', $jwksUri)) return '';
+		if($kid === '') return '';
 
 		$cacheKey = 'oidc_jwks_' . md5($jwksUri);
 		$jwks = $this->wire('cache')->get($cacheKey);
+		$wasCached = is_array($jwks);
 		if(!is_array($jwks)) {
-			$jwks = $this->httpGet($jwksUri, '');
-			if(empty($jwks['keys']) || !is_array($jwks['keys'])) return '';
-			$this->wire('cache')->save($cacheKey, $jwks, 3600);
+			$jwks = $this->fetchJwks($jwksUri, $cacheKey);
 		}
+		$key = $this->findJwksPublicKey($jwks, $kid);
+		if($key !== '') return $key;
+		if(!$wasCached) return '';
+		// A new kid normally means key rotation; bypass the cache once.
+		$jwks = $this->fetchJwks($jwksUri, $cacheKey);
+		return $this->findJwksPublicKey($jwks, $kid);
+	}
 
+	protected function fetchJwks(string $jwksUri, string $cacheKey): array {
+		$jwks = $this->httpGet($jwksUri, '');
+		if(empty($jwks['keys']) || !is_array($jwks['keys'])) return [];
+		$this->wire('cache')->save($cacheKey, $jwks, 3600);
+		return $jwks;
+	}
+
+	protected function findJwksPublicKey(array $jwks, string $kid): string {
+		if(empty($jwks['keys']) || !is_array($jwks['keys'])) return '';
 		foreach($jwks['keys'] as $jwk) {
 			if(!is_array($jwk)) continue;
-			if($kid && (($jwk['kid'] ?? '') !== $kid)) continue;
+			if(($jwk['kid'] ?? '') !== $kid) continue;
 			if(($jwk['kty'] ?? '') !== 'RSA') continue;
+			if(($jwk['use'] ?? '') !== 'sig') continue;
+			if(($jwk['alg'] ?? '') !== 'RS256') continue;
+			if(isset($jwk['key_ops']) && (!is_array($jwk['key_ops']) || !in_array('verify', $jwk['key_ops'], true))) continue;
 
 			if(!empty($jwk['x5c'][0])) {
 				return "-----BEGIN CERTIFICATE-----\n"
@@ -1005,8 +1070,9 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 	// -----------------------------------------------------------------
 
 	public function httpPost(string $url, array $params, string $accept = 'json'): array {
+		$resolution = $this->assertSafeHttpsUrl($url);
 		$ch = curl_init($url);
-		curl_setopt_array($ch, [
+		$options = [
 			CURLOPT_RETURNTRANSFER => true,
 			CURLOPT_POST           => true,
 			CURLOPT_POSTFIELDS     => http_build_query($params),
@@ -1014,10 +1080,13 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 				'Accept: application/' . ($accept === 'json' ? 'json' : 'x-www-form-urlencoded'),
 				'Content-Type: application/x-www-form-urlencoded',
 			],
-			CURLOPT_TIMEOUT        => 10,
+			CURLOPT_TIMEOUT        => self::HTTP_TIMEOUT,
+			CURLOPT_CONNECTTIMEOUT => self::HTTP_CONNECT_TIMEOUT,
 			CURLOPT_SSL_VERIFYPEER => true,
 			CURLOPT_SSL_VERIFYHOST => 2,
-		]);
+		];
+		if($resolution['resolve'] !== '') $options[CURLOPT_RESOLVE] = [$resolution['resolve']];
+		curl_setopt_array($ch, $options);
 		$response = (string) curl_exec($ch);
 		$error = curl_error($ch);
 		$status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -1035,16 +1104,20 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 	}
 
 	public function httpGet(string $url, string $token): array {
-		$headers = ['Accept: application/json', 'User-Agent: ProcessWire-Oidc/1.1'];
+		$resolution = $this->assertSafeHttpsUrl($url);
+		$headers = ['Accept: application/json', 'User-Agent: ProcessWire-Oidc/1.2'];
 		if($token) $headers[] = "Authorization: Bearer {$token}";
 		$ch = curl_init($url);
-		curl_setopt_array($ch, [
+		$options = [
 			CURLOPT_RETURNTRANSFER => true,
 			CURLOPT_HTTPHEADER     => $headers,
-			CURLOPT_TIMEOUT        => 10,
+			CURLOPT_TIMEOUT        => self::HTTP_TIMEOUT,
+			CURLOPT_CONNECTTIMEOUT => self::HTTP_CONNECT_TIMEOUT,
 			CURLOPT_SSL_VERIFYPEER => true,
 			CURLOPT_SSL_VERIFYHOST => 2,
-		]);
+		];
+		if($resolution['resolve'] !== '') $options[CURLOPT_RESOLVE] = [$resolution['resolve']];
+		curl_setopt_array($ch, $options);
 		$response = (string) curl_exec($ch);
 		$error = curl_error($ch);
 		$status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -1057,13 +1130,57 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 	// Internal helpers
 	// -----------------------------------------------------------------
 
+	protected function storeTransaction(string $state, array $transaction): void {
+		$session = $this->wire('session');
+		$transactions = $session->getFor($this, 'oidc_transactions');
+		$transactions = is_array($transactions) ? $transactions : [];
+		$now = time();
+		foreach($transactions as $key => $row) {
+			if(!is_array($row) || (int) ($row['created'] ?? 0) < $now - self::TRANSACTION_TTL) unset($transactions[$key]);
+		}
+		$transactions[hash('sha256', $state)] = $transaction;
+		$session->setFor($this, 'oidc_transactions', $transactions);
+	}
+
+	protected function consumeTransaction(string $state, string $provider): array {
+		if($state === '') return [];
+		$session = $this->wire('session');
+		$transactions = $session->getFor($this, 'oidc_transactions');
+		$transactions = is_array($transactions) ? $transactions : [];
+		$key = hash('sha256', $state);
+		$transaction = $transactions[$key] ?? null;
+		unset($transactions[$key]);
+		$session->setFor($this, 'oidc_transactions', $transactions);
+		if(!is_array($transaction)) return [];
+		if(!hash_equals((string) ($transaction['provider'] ?? ''), $provider)) return [];
+		$created = (int) ($transaction['created'] ?? 0);
+		if($created < time() - self::TRANSACTION_TTL || $created > time() + 60) return [];
+		return $transaction;
+	}
+
+	protected function runtimeProviders(): array {
+		$config = $this->wire('config');
+		$runtime = $config->oidcProviders ?? [];
+		if(!is_array($runtime)) return [];
+		$out = [];
+		foreach($runtime as $id => $row) {
+			if(!is_array($row)) continue;
+			$id = strtolower($this->wire('sanitizer')->name((string) ($row['id'] ?? $id)));
+			if($id === '') continue;
+			$out[$id] = $row;
+		}
+		return $out;
+	}
+
 	/**
 	 * Resolve the callback URL: module setting > current page httpUrl.
 	 * The callback URL must be the same page that renders ?oidc= buttons.
 	 */
 	protected function resolveCallbackUrl(): string {
 		$setting = trim((string) $this->callbackUrl);
-		return $setting ?: $this->wire('page')->httpUrl();
+		$url = $setting ?: $this->wire('page')->httpUrl();
+		$this->parseHttpsUrl($url);
+		return $url;
 	}
 
 	/**
@@ -1082,12 +1199,92 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 			'token_type'     => 'json',
 			'email_field'    => 'email',
 			'name_field'     => 'name',
-			'verified_field' => null,
+			'verified_field' => 'email_verified',
 			'email_verified_required' => true,
 			'extra_emails'   => false,
 			'oidc'           => true,
 			'pkce'           => true,
 		];
+	}
+
+	protected function issuerIsAllowed(string $issuer): bool {
+		$allowed = $this->wire('config')->oidcAllowedIssuers ?? [];
+		if(!is_array($allowed)) return false;
+		$issuer = rtrim($issuer, '/');
+		foreach($allowed as $candidate) {
+			if(rtrim((string) $candidate, '/') === $issuer) return true;
+		}
+		return false;
+	}
+
+	protected function assertProviderEndpoints(array $cfg): void {
+		$issuer = (string) ($cfg['issuer'] ?? '');
+		if($issuer === '') throw new WireException('OIDC: discovery issuer is missing');
+		$this->assertSafeHttpsUrl($issuer);
+		$issuerOrigin = $this->urlOrigin($issuer);
+		$allowedOrigins = $this->wire('config')->oidcAllowedEndpointOrigins ?? [];
+		$allowedOrigins = is_array($allowedOrigins) ? array_map(fn($v) => rtrim((string) $v, '/'), $allowedOrigins) : [];
+		foreach(['auth_url', 'token_url', 'userinfo_url', 'jwks_uri'] as $key) {
+			$url = (string) ($cfg[$key] ?? '');
+			if($url === '' && $key === 'userinfo_url') continue;
+			if($url === '') throw new WireException("OIDC: {$key} is missing");
+			$this->assertSafeHttpsUrl($url);
+			$origin = $this->urlOrigin($url);
+			if($origin !== $issuerOrigin && !in_array($origin, $allowedOrigins, true)) {
+				throw new WireException("OIDC: cross-origin {$key} is not allowed");
+			}
+		}
+	}
+
+	protected function urlOrigin(string $url): string {
+		$parts = parse_url($url);
+		$host = strtolower((string) ($parts['host'] ?? ''));
+		$port = isset($parts['port']) ? ':' . (int) $parts['port'] : '';
+		return 'https://' . $host . $port;
+	}
+
+	protected function assertSafeHttpsUrl(string $url): array {
+		$parts = $this->parseHttpsUrl($url);
+		$host = trim(strtolower(rtrim((string) ($parts['host'] ?? ''), '.')), '[]');
+		if($host === '' || $host === 'localhost' || str_ends_with($host, '.local')) {
+			throw new WireException('OIDC: endpoint host is not allowed');
+		}
+		$ips = [];
+		if(filter_var($host, FILTER_VALIDATE_IP)) {
+			$ips[] = $host;
+		} else {
+			$records = dns_get_record($host, DNS_A | DNS_AAAA);
+			foreach($records ?: [] as $record) {
+				if(!empty($record['ip'])) $ips[] = $record['ip'];
+				if(!empty($record['ipv6'])) $ips[] = $record['ipv6'];
+			}
+		}
+		if(!$ips) throw new WireException('OIDC: endpoint host cannot be resolved');
+		foreach($ips as $ip) {
+			if(filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
+				throw new WireException('OIDC: private or reserved endpoint address rejected');
+			}
+		}
+		$port = (int) ($parts['port'] ?? 443);
+		$ip = (string) reset($ips);
+		$resolvedIp = str_contains($ip, ':') ? "[{$ip}]" : $ip;
+		return [
+			'host' => $host,
+			'port' => $port,
+			'ip' => $ip,
+			'resolve' => filter_var($host, FILTER_VALIDATE_IP) ? '' : "{$host}:{$port}:{$resolvedIp}",
+		];
+	}
+
+	protected function parseHttpsUrl(string $url): array {
+		$parts = parse_url($url);
+		if(!is_array($parts) || strtolower((string) ($parts['scheme'] ?? '')) !== 'https' || empty($parts['host'])) {
+			throw new WireException('OIDC: HTTPS URL required');
+		}
+		if(!empty($parts['user']) || !empty($parts['pass']) || isset($parts['fragment'])) {
+			throw new WireException('OIDC: URL contains forbidden components');
+		}
+		return $parts;
 	}
 
 	/**
@@ -1097,8 +1294,11 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 	protected function safeRedirectUrl(string $url): string {
 		$url = trim($url);
 		if(!$url) return '';
+		if(preg_match('/[\x00-\x1F\x7F\\\\]/', $url)) return '';
+		$decoded = rawurldecode($url);
+		if(preg_match('/[\x00-\x1F\x7F\\\\]/', $decoded)) return '';
 		// Reject anything with a scheme, protocol-relative, or backslash tricks
-		if(preg_match('~^([a-zA-Z][a-zA-Z0-9+\-.]*:|//|\\\\)~', $url)) return '';
+		if(preg_match('~^([a-zA-Z][a-zA-Z0-9+\-.]*:|//)~', $url) || str_starts_with($decoded, '//')) return '';
 		// Must start with /
 		if(!str_starts_with($url, '/')) return '';
 		// parse_url must not find a host
