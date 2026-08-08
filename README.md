@@ -6,9 +6,9 @@ Oidc adds lightweight OAuth 2.0 and OpenID Connect login to ProcessWire: social 
 
 It is made for sites that need external authentication without a full account-management suite: client portals, intranets, member areas, editorial tools, SaaS dashboards and private ProcessWire projects.
 
-**Repository:** [github.com/mxmsmnv/Oidc](https://github.com/mxmsmnv/Oidc)  
-**Author:** Maxim Semenov  
-**Website:** [smnv.org](https://smnv.org)  
+**Repository:** [github.com/mxmsmnv/Oidc](https://github.com/mxmsmnv/Oidc)
+**Author:** Maxim Semenov
+**Website:** [smnv.org](https://smnv.org)
 **Email:** [maxim@smnv.org](mailto:maxim@smnv.org)
 
 If this project helps your work, consider supporting future development: [GitHub Sponsors](https://github.com/sponsors/mxmsmnv) or [smnv.org/sponsor](https://smnv.org/sponsor/).
@@ -91,8 +91,8 @@ Run the dependency-free security test suite with `php tests/run.php`.
 
 ## Author
 
-Maxim Semenov  
-[smnv.org](https://smnv.org)  
+Maxim Semenov
+[smnv.org](https://smnv.org)
 [maxim@smnv.org](mailto:maxim@smnv.org)
 
 ## License
