@@ -26,6 +26,7 @@ If this project helps your work, consider supporting future development: [GitHub
 - Auto-registers new ProcessWire users or lets hooks take over registration.
 - Blocks superuser OIDC login by default and supports role allow-lists.
 - Preserves return URLs through the login flow.
+- Can redirect failed callbacks to a project-owned page with a safe `oidc_error` reason code instead of rendering a framework exception.
 - Includes silent mode for SSO-only sites and intranets.
 - Provides hook points for identity resolution, login, registration and provider definitions.
 
@@ -72,6 +73,8 @@ echo $oidc->renderButtons();
 ```
 
 The page that renders the buttons is also the callback page. Register the exact generated redirect URI, including `?oidc=<provider-id>`, in each provider's OAuth application settings.
+
+For a public login page, set **Redirect after failed callback** to a relative path such as `/login/`. The module redirects there with one of a small set of non-sensitive reason codes (for example `email_unverified` or `invalid_state`) and writes only redacted diagnostic metadata to the `oidc` log. It never places provider responses, tokens, email addresses, or exception messages in the redirect URL.
 
 ## Installation
 

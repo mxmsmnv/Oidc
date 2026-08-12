@@ -63,6 +63,7 @@
  * @property string $buttonStyle    Button style: full|icon
  * @property string $callbackUrl    Fixed callback URL registered with providers
  * @property string $loginRedirect  URL to redirect after login (empty = ?oidc_login=1)
+ * @property string $errorRedirect  Relative URL that receives a safe oidc_error code after a failed callback
  * @property bool   $autoRegister   Auto-register unknown users
  * @property string $newUserRole    Role name assigned to auto-registered users
  * @property array  $identityLinks  Provider subject links keyed by provider/issuer/sub
@@ -80,7 +81,7 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 		return [
 			'title'    => 'Oidc',
 			'summary'  => 'OAuth 2.0 / OpenID Connect: Google, GitHub, LinkedIn, Microsoft, Yandex, Yahoo, and any OIDC-compatible provider.',
-			'version'  => 120,
+			'version'  => 121,
 			'icon'     => 'key',
 			'author'   => 'Maxim Semenov',
 			'href'     => 'https://smnv.org',
@@ -98,6 +99,7 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 		$this->set('buttonStyle',      'full');
 		$this->set('callbackUrl',      '');
 		$this->set('loginRedirect',    '');
+		$this->set('errorRedirect',    '');
 		$this->set('autoRegister',     true);
 		$this->set('newUserRole',      '');
 		$this->set('silentMode',       false);
@@ -131,7 +133,11 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 		// Handle explicit ?oidc= callback
 		$provider = (string) $input->get('oidc');
 		if($provider) {
-			$this->runFlow(trim($provider));
+			try {
+				$this->runFlow(trim($provider));
+			} catch(WireException $failure) {
+				$this->handleFlowFailure($failure, trim($provider));
+			}
 			return;
 		}
 
@@ -152,6 +158,56 @@ class Oidc extends WireData implements Module, ConfigurableModule {
 			$this->wire('session')->setFor($this, 'oidc_return', $page->url);
 			$this->runFlow($pid);
 		}
+	}
+
+	/**
+	 * Convert an expected callback failure into a safe project-owned redirect.
+	 *
+	 * The provider response, tokens, email address and exception message are
+	 * deliberately excluded from the redirect and log entry. Projects that do
+	 * not configure errorRedirect retain the traditional exception behavior.
+	 */
+	protected function handleFlowFailure(WireException $failure, string $provider): void {
+		$destination = $this->safeRedirectUrl((string) $this->errorRedirect);
+		if($destination === '') throw $failure;
+
+		$code = $this->flowFailureCode($failure);
+		$provider = strtolower($this->wire('sanitizer')->name($provider));
+		$log = $this->wire('log');
+		if($log && method_exists($log, 'save')) {
+			$log->save('oidc', json_encode([
+				'event' => 'callback_failed',
+				'provider' => $provider,
+				'code' => $code,
+				'exception' => get_class($failure),
+			], JSON_UNESCAPED_SLASHES));
+		}
+
+		$separator = str_contains($destination, '?') ? '&' : '?';
+		$this->wire('session')->redirect(
+			$destination . $separator . http_build_query(['oidc_error' => $code], '', '&', PHP_QUERY_RFC3986),
+			303
+		);
+	}
+
+	/**
+	 * Return a public, non-sensitive reason code for a callback failure.
+	 */
+	protected function flowFailureCode(WireException $failure): string {
+		$message = strtolower($failure->getMessage());
+		if(str_contains($message, 'unverified email') || str_contains($message, 'verified email claim')) {
+			return 'email_unverified';
+		}
+		if(str_contains($message, 'account with this email already exists') || str_contains($message, 'refusing to link')) {
+			return 'account_link_required';
+		}
+		if(str_contains($message, 'auto-registration is disabled')) return 'registration_disabled';
+		if(str_contains($message, 'state mismatch')) return 'invalid_state';
+		if(str_contains($message, 'provider returned error access_denied')) return 'access_denied';
+		if(str_contains($message, 'superuser login is blocked') || str_contains($message, 'not allowed to login')) {
+			return 'account_not_allowed';
+		}
+		return 'authentication_failed';
 	}
 
 	// -----------------------------------------------------------------
@@ -1582,7 +1638,7 @@ HTML;
 		$f->label       = 'Callback URL';
 		$f->notes       = 'Fixed URL registered with your OAuth providers. Must be the same page where renderButtons() is called. Leave blank to use the current page URL at runtime (not recommended for production).';
 		$f->attr('value', $this->callbackUrl);
-		$f->columnWidth = 50;
+		$f->columnWidth = 33;
 		$fs->add($f);
 
 		$f = $modules->get('InputfieldText');
@@ -1590,7 +1646,15 @@ HTML;
 		$f->label       = 'Redirect after login';
 		$f->notes       = 'Relative path, e.g. /account/. Leave blank to use ?return= from URL, or fall back to ?oidc_login=1.';
 		$f->attr('value', $this->loginRedirect);
-		$f->columnWidth = 50;
+		$f->columnWidth = 34;
+		$fs->add($f);
+
+		$f = $modules->get('InputfieldText');
+		$f->attr('name', 'errorRedirect');
+		$f->label       = 'Redirect after failed callback';
+		$f->notes       = 'Optional relative path, e.g. /login/. Receives only a safe oidc_error reason code; provider details and tokens are never added to the URL.';
+		$f->attr('value', $this->errorRedirect);
+		$f->columnWidth = 33;
 		$fs->add($f);
 
 		// Silent mode — redirect unauthenticated users straight to provider

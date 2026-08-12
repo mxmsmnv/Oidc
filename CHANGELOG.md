@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.1
+
+- Added an optional failure redirect that converts expected callback failures into non-sensitive `oidc_error` reason codes instead of exposing framework error pages.
+- Added redacted callback-failure logging with provider, public reason code, and exception class only; tokens, provider responses, email addresses, and exception messages are not logged.
+- Kept the legacy exception behavior when no failure redirect is configured.
+
 ## 1.2.0
 
 - Made OIDC authentication fail closed unless a signed `id_token` contains valid `iss`, `aud`, `exp`, `sub`, and `nonce` claims; added `azp` validation for multiple audiences.

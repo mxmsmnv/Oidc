@@ -42,6 +42,10 @@ namespace ProcessWire {
 		public function get(string $key) { return $this->data[$key] ?? null; }
 		public function save(string $key, $value, int $ttl): void { $this->data[$key] = $value; }
 	}
+	final class FakeLog {
+		public array $entries = [];
+		public function save(string $channel, string $message): void { $this->entries[] = [$channel, $message]; }
+	}
 
 	final class FakeSanitizer {
 		public function name(string $value): string { return preg_replace('/[^a-zA-Z0-9_-]/', '', $value) ?? ''; }
@@ -70,6 +74,8 @@ namespace ProcessWire {
 		public function resolveJwk(string $uri, string $kid): string { return parent::getJwksPublicKey($uri, $kid); }
 		public function safeEndpoint(string $url): void { $this->assertSafeHttpsUrl($url); }
 		public function providerEndpoints(array $cfg): void { $this->assertProviderEndpoints($cfg); }
+		public function failureCode(string $message): string { return $this->flowFailureCode(new WireException($message)); }
+		public function redirectFailure(string $message, string $provider): void { $this->handleFlowFailure(new WireException($message), $provider); }
 	}
 
 	class FlowOidc extends Oidc {
@@ -108,6 +114,7 @@ namespace ProcessWire {
 namespace {
 	use ProcessWire\FakeCache;
 	use ProcessWire\FakeInput;
+	use ProcessWire\FakeLog;
 	use ProcessWire\FakeSanitizer;
 	use ProcessWire\FakeSession;
 	use ProcessWire\TestOidc;
@@ -204,6 +211,33 @@ namespace {
 		]);
 		$assert(false, 'cross-origin token endpoint accepted');
 	} catch(WireException $e) { $assert(true, 'cross-origin endpoint rejected'); }
+
+	$failureCodes = [
+		'OIDC: unverified email from FusionAuth' => 'email_unverified',
+		'OIDC: an account with this email already exists; login first to link this provider' => 'account_link_required',
+		'OIDC: no account found and auto-registration is disabled' => 'registration_disabled',
+		'OIDC: state mismatch — possible CSRF attempt' => 'invalid_state',
+		'OIDC: provider returned error access_denied' => 'access_denied',
+		'OIDC: superuser login is blocked for fusionauth' => 'account_not_allowed',
+		'OIDC: token exchange failed for FusionAuth' => 'authentication_failed',
+	];
+	foreach($failureCodes as $message => $expectedCode) {
+		$assert($oidc->failureCode($message) === $expectedCode, "wrong public failure code for {$expectedCode}");
+	}
+	$failureLog = new FakeLog();
+	$failureSession = new FakeSession();
+	$failureOidc = new TestOidc(['session' => $failureSession, 'log' => $failureLog, 'config' => $config, 'sanitizer' => new FakeSanitizer()]);
+	$failureOidc->errorRedirect = '/login/';
+	try {
+		$failureOidc->redirectFailure('OIDC: unverified email from FusionAuth for private@example.com token-secret', 'fusionauth');
+		$assert(false, 'failure redirect did not run');
+	} catch(RedirectException $e) {
+		$assert($e->status === 303, 'failure redirect is not a 303');
+		$assert($e->url === '/login/?oidc_error=email_unverified', 'failure redirect leaked details or used the wrong reason');
+	}
+	$failureLogText = json_encode($failureLog->entries);
+	$assert(!str_contains($failureLogText, 'private@example.com'), 'failure log leaked the email address');
+	$assert(!str_contains($failureLogText, 'token-secret'), 'failure log leaked provider details');
 
 	$flowSession = new FakeSession();
 	$flowInput = new FakeInput();

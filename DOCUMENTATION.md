@@ -48,6 +48,8 @@ echo $oidc->renderButtons();
 
 The page that renders the buttons is also the callback page. Set its full URL in **Settings → Callback URL** and register the exact generated redirect URI, including `?oidc=<provider-id>`, in each provider's OAuth application settings.
 
+Set **Redirect after failed callback** to a relative project-owned path such as `/login/` when the public site should handle expected failures itself. The destination receives only `?oidc_error=<reason>`, where the reason is a small non-sensitive code such as `email_unverified`, `account_link_required`, `invalid_state`, or `authentication_failed`. Provider responses, tokens, email addresses, and exception messages are never included in the URL or the module's redacted failure log.
+
 OIDC callbacks use one-time state-scoped transactions with a 10-minute TTL. The registered redirect URI includes the provider query parameter, for example `https://yoursite.com/login/?oidc=company`; use exact-match redirect validation at the provider.
 
 ### Private runtime credentials
